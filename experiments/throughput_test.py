@@ -8,8 +8,6 @@ from solcx import compile_source, install_solc
 import subprocess
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
-
-# -------------------------- Global Configuration (Aligned with Paper) --------------------------
 SOLC_VERSION = "0.8.26"
 GANACHE_URL = "http://127.0.0.1:8545"
 GAS_PRICE = Web3.to_wei(20, "gwei")  # Fixed 20 Gwei (paper setting)
@@ -23,8 +21,7 @@ TEST_ACCOUNTS = []
 for i in range(100):
     acc = Account.create(f"rbdms_throughput_user_{i}")
     TEST_ACCOUNTS.append((acc.address, acc.privateKey.hex()))
-
-# -------------------------- Smart Contract (Collaborative Update with OIL) --------------------------
+    
 CONTRACT_SOURCE_CODE = """
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.26;
@@ -134,7 +131,6 @@ contract RBDMS_ThroughputTest {
 }
 """
 
-# -------------------------- Blockchain Initialization --------------------------
 def start_ganache():
     """Start Ganache private PoA network (match paper's testbed)"""
     # Kill existing Ganache processes to avoid port conflicts
@@ -205,7 +201,6 @@ def compile_deploy_contract(w3):
     print(f"Contract deployed at: {tx_receipt['contractAddress']}")
     return deployed_contract
 
-# -------------------------- Throughput Test Core Logic --------------------------
 def simulate_doctor_update(w3, contract, user_idx):
     """Simulate a doctor (user) updating the shared medical record"""
     user_addr, user_priv = TEST_ACCOUNTS[user_idx]
@@ -336,6 +331,5 @@ def plot_throughput_results(users, throughput):
     plt.savefig('rbdms_ethereum_throughput.png', dpi=300, bbox_inches='tight')
     print("Throughput plot saved as 'rbdms_ethereum_throughput.png'")
 
-# -------------------------- Execute Tests --------------------------
 if __name__ == "__main__":
     run_throughput_tests()
