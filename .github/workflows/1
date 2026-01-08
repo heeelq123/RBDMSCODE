@@ -1,1 +1,130 @@
+# RBDMS: Automatic Testing & Experimental Reproducibility
+
+name: RBDMS Automated Testing and Reproducibility
+
+on:
+  push:
+    branches: [ main, dev ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+
+  # Job 1: Environment Setup
+
+  setup-env:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12.5
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12.5"
+          cache: "pip"
+
+      - name: Install system dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y build-essential libssl-dev python3-dev curl
+
+      - name: Install Python dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Install Solidity compiler (v0.8.26)
+        uses: ethereum/setup-solc@v1
+        with:
+          solc-version: "0.8.26"
+
+      - name: Set up Node.js for Hardhat/Ganache
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install Ganache
+        run: npm install -g ganache
+
+
+  # Job 2: Code Quality Check
+
+  lint-code:
+    runs-on: ubuntu-24.04
+    needs: setup-env
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12.5"
+          cache: "pip"
+
+      - name: Install linting tools
+        run: pip install black isort flake8
+
+      - name: Check code formatting (Black)
+        run: black --check .
+
+      - name: Check import order (Isort)
+        run: isort --check .
+
+      - name: Static code analysis (Flake8)
+        run: flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
+
+
+  # Job 3: Experiments & Smart Contract Evaluation
+
+  run-experiments:
+    runs-on: ubuntu-24.04
+    needs: [setup-env, lint-code]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12.5"
+          cache: "pip"
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Launch local Ethereum PoA testnet
+        run: |
+          ganache --port 8545 \
+                  --chain.chainId 1337 \
+                  --wallet.totalAccounts 5 \
+                  --wallet.defaultBalance 1000 \
+                  --miner.blockGasLimit 30000000 \
+                  --miner.defaultGasPrice 20000000000 &
+
+      - name: Compile and deploy smart contracts
+        run: |
+          cd contracts
+          npm install
+          npx hardhat compile
+          npx hardhat run scripts/deploy.js --network localhost
+
+      - name: Run cryptographic protocol tests (Charm + CP-ABE + TUCH)
+        run: python tests/test_crypto.py
+
+      - name: Reproduce performance evaluation
+        run: python experiments/performance_test.py
+
+      - name: Upload experimental results
+        uses: actions/upload-artifact@v4
+        with:
+          name: RBDMS-Experiment-Results
+          path: |
+            results/
+            logs/
 
