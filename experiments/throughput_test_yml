@@ -1,144 +1,176 @@
 import time
-import numpy as np
-import matplotlib.pyplot as plt
+import threading
+import random
 from web3 import Web3
 from web3.middleware import geth_poa_middleware
-from eth_account import Account
-from solcx import compile_source, install_solc
-import subprocess
+import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import logging
 
-# Basic config (match paper)
-SOLC_VERSION = "0.8.26"
-GANACHE_URL = "http://127.0.0.1:8545"
-GAS_PRICE = Web3.to_wei(20, "gwei")
-CONCURRENT_USERS = [10,20,30,40,50,60,70,80,90,100]
-TEST_ROUNDS = 3
-RECORD_ID = 0
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(threadName)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
-# Generate test accounts
-TEST_ACCOUNTS = []
-for i in range(100):
-    acc = Account.create(f"user_{i}")
-    TEST_ACCOUNTS.append((acc.address, acc.privateKey.hex()))
-
-# Simple contract (core OIL logic only)
-CONTRACT_SOURCE = """
-pragma solidity ^0.8.26;
-contract RBDMS {
-    struct Record { bytes32 hash; address lockHolder; bool locked; uint256 lockExpiry; }
-    mapping(uint256 => Record) records;
-    uint256 constant LOCK_TIME = 10;
-
-    function initRecord(uint256 id, bytes32 hash) external {
-        records[id] = Record(hash, address(0), false, 0);
+# Configuration Parameters
+ETH_NODE_URL = "http://127.0.0.1:8545"
+CONTRACT_ADDRESS = "0xYourDeployedContractAddress"
+CONTRACT_ABI = json.loads('''
+[
+    {
+        "inputs": [
+            {"internalType": "bytes32", "name": "recordId", "type": "bytes32"},
+            {"internalType": "bytes", "name": "modifiedData", "type": "bytes"},
+            {"internalType": "bytes", "name": "signature", "type": "bytes"}
+        ],
+        "name": "updateMedicalRecord",
+        "outputs": [{"internalType": "bool", "name": "", "type": "bool"}],
+        "stateMutability": "nonpayable",
+        "type": "function"
+    },
+    {
+        "inputs": [{"internalType": "bytes32", "name": "recordId", "type": "bytes32"}],
+        "name": "getRecordHash",
+        "outputs": [{"internalType": "bytes32", "name": "", "type": "bytes32"}],
+        "stateMutability": "view",
+        "type": "function"
     }
+]
+''')
+TEST_ACCOUNTS = [
+    "0xAccount1Address",
+    "0xAccount2Address",
+]
+RECORD_IDS = [Web3.keccak(text=f"EMR_{i}") for i in range(100)]
+CONCURRENT_USER_RANGES = [10, 20, 30, 50, 70, 100]
+TEST_DURATION = 30
+GAS_LIMIT = 300000
+GAS_PRICE = Web3.to_wei(20, 'gwei')
 
-    function acquireLock(uint256 id) external returns (bool) {
-        Record storage r = records[id];
-        if (r.locked && block.timestamp < r.lockExpiry) return false;
-        r.locked = true;
-        r.lockHolder = msg.sender;
-        r.lockExpiry = block.timestamp + LOCK_TIME;
-        return true;
-    }
+# Initialize Web3 Connection
+w3 = Web3(Web3.HTTPProvider(ETH_NODE_URL))
+w3.middleware_onion.inject(geth_poa_middleware, layer=0)
 
-    function updateRecord(uint256 id, bytes32 newHash) external returns (bool) {
-        Record storage r = records[id];
-        if (!r.locked || r.lockHolder != msg.sender || block.timestamp > r.lockExpiry) return false;
-        r.hash = newHash;
-        r.locked = false;
-        return true;
-    }
+if not w3.is_connected():
+    raise ConnectionError("Failed to connect to Ethereum node. Check node address.")
 
-    function getModCount(uint256 id) external view returns (uint256) {
-        return 1; // Simplified for testing
-    }
-}
-"""
+contract = w3.eth.contract(address=CONTRACT_ADDRESS, abi=CONTRACT_ABI)
 
-# Compile/deploy contract (simplified)
-def deploy_contract(w3):
-    # Install solc if missing
-    install_solc(SOLC_VERSION)
-    # Compile
-    compiled = compile_source(CONTRACT_SOURCE, solc_version=SOLC_VERSION)
-    abi, bytecode = compiled.popitem()[1]["abi"], compiled.popitem()[1]["bin"]
-    # Deploy
-    acct_addr, acct_key = TEST_ACCOUNTS[0]
-    nonce = w3.eth.get_transaction_count(acct_addr)
-    contract = w3.eth.contract(abi=abi, bytecode=bytecode)
-    tx = contract.constructor().build_transaction({"from":acct_addr, "nonce":nonce, "gas":30000000, "gasPrice":GAS_PRICE})
-    signed_tx = w3.eth.account.sign_transaction(tx, acct_key)
-    tx_hash = w3.eth.send_raw_transaction(signed_tx.rawTransaction)
-    tx_receipt = w3.eth.wait_for_transaction_receipt(tx_hash)
-    # Init record
-    deployed = w3.eth.contract(address=tx_receipt["contractAddress"], abi=abi)
-    init_tx = deployed.functions.initRecord(RECORD_ID, w3.keccak(text="init")).build_transaction({"from":acct_addr, "nonce":nonce+1, "gas":30000000, "gasPrice":GAS_PRICE})
-    signed_init = w3.eth.account.sign_transaction(init_tx, acct_key)
-    w3.eth.send_raw_transaction(signed_init.rawTransaction)
-    return deployed
+# Utility Functions
+def generate_random_medical_data():
+    data_types = [
+        b"BP:120/80,HR:72,TEMP:36.5",
+        b"BP:135/85,HR:80,TEMP:36.8",
+        b"DIAGNOSIS:Hypertension,Medication:Lisinopril",
+        b"LAB:Glucose=5.6,HbA1c=5.7",
+    ]
+    return random.choice(data_types)
 
-# Simulate doctor update (simplified)
-def simulate_update(w3, contract, user_idx):
-    addr, key = TEST_ACCOUNTS[user_idx]
-    success = False
-    for _ in range(3): # 3 retries
-        try:
-            nonce = w3.eth.get_transaction_count(addr)
-            # Acquire lock
-            lock_tx = contract.functions.acquireLock(RECORD_ID).build_transaction({"from":addr, "nonce":nonce, "gas":30000000, "gasPrice":GAS_PRICE})
-            signed_lock = w3.eth.account.sign_transaction(lock_tx, key)
-            w3.eth.send_raw_transaction(signed_lock.rawTransaction)
-            # Update record
-            new_hash = w3.keccak(text=f"update_{user_idx}_{time.time()}")
-            update_tx = contract.functions.updateRecord(RECORD_ID, new_hash).build_transaction({"from":addr, "nonce":nonce+1, "gas":30000000, "gasPrice":GAS_PRICE})
-            signed_update = w3.eth.account.sign_transaction(update_tx, key)
-            w3.eth.send_raw_transaction(signed_update.rawTransaction)
-            success = True
-            break
-        except:
-            time.sleep(0.5)
-    return {"success": success}
+def sign_data(private_key, data):
+    hash_data = Web3.keccak(data)
+    signed = w3.eth.account.sign_hash(hash_data, private_key=private_key)
+    return signed.signature
 
-# Main test function
-def run_tests():
-    # Connect to Ganache
-    w3 = Web3(Web3.HTTPProvider(GANACHE_URL))
-    w3.middleware_onion.inject(geth_poa_middleware, layer=0)
-    # Deploy contract
-    contract = deploy_contract(w3)
-    # Test throughput
-    results = []
-    for user_count in CONCURRENT_USERS:
-        total_success = 0
-        for _ in range(TEST_ROUNDS):
-            start = time.time()
-            with ThreadPoolExecutor(max_workers=user_count) as executor:
-                tasks = [executor.submit(simulate_update, w3, contract, i) for i in range(user_count)]
-                for task in as_completed(tasks):
-                    if task.result()["success"]:
-                        total_success += 1
-            end = time.time()
-        # Calculate TPS
-        avg_tps = total_success / ((end - start)/TEST_ROUNDS)
-        results.append(avg_tps)
-        print(f"{user_count} users → {avg_tps:.2f} TPS")
+def send_update_transaction(account, private_key, record_id):
+    try:
+        modified_data = generate_random_medical_data()
+        signature = sign_data(private_key, modified_data + record_id)
+        
+        nonce = w3.eth.get_transaction_count(account)
+        tx = contract.functions.updateMedicalRecord(
+            recordId=record_id,
+            modifiedData=modified_data,
+            signature=signature
+        ).build_transaction({
+            "from": account,
+            "nonce": nonce,
+            "gas": GAS_LIMIT,
+            "gasPrice": GAS_PRICE,
+        })
+        
+        signed_tx = w3.eth.account.sign_transaction(tx, private_key=private_key)
+        tx_hash = w3.eth.send_raw_transaction(signed_tx.rawTransaction)
+        
+        receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=30)
+        if receipt.status == 1:
+            logger.info(f"Transaction successful: {tx_hash.hex()}, Record ID: {record_id.hex()[:8]}...")
+            return True
+        else:
+            logger.error(f"Transaction failed: {tx_hash.hex()}, Status code: {receipt.status}")
+            return False
+    except Exception as e:
+        logger.error(f"Transaction sending failed: {str(e)}")
+        return False
+
+# Throughput Test Core
+def throughput_test(concurrent_users):
+    logger.info(f"Test started: Concurrent users = {concurrent_users}, Test duration = {TEST_DURATION}s")
     
-    # Plot results
-    plt.plot(CONCURRENT_USERS, results, 's-', color='red', label='RBDMS')
-    plt.axvline(x=70, linestyle='--', color='orange', label='Saturation (70 users)')
-    plt.xlabel('Concurrent Users')
-    plt.ylabel('TPS')
-    plt.legend()
-    plt.savefig('rbdms_throughput.png')
-    # Save data
-    np.savez('results.npz', users=CONCURRENT_USERS, tps=results)
+    user_accounts = random.sample(TEST_ACCOUNTS, min(concurrent_users, len(TEST_ACCOUNTS)))
+    user_private_keys = [
+        "0xYourTestAccountPrivateKey1",
+        "0xYourTestAccountPrivateKey2",
+    ][:concurrent_users]
+    
+    successful_txs = 0
+    start_time = time.time()
+    end_time = start_time + TEST_DURATION
+    
+    with ThreadPoolExecutor(max_workers=concurrent_users, thread_name_prefix="User") as executor:
+        while time.time() < end_time:
+            futures = []
+            for idx in range(concurrent_users):
+                account = user_accounts[idx % len(user_accounts)]
+                private_key = user_private_keys[idx % len(user_private_keys)]
+                record_id = random.choice(RECORD_IDS)
+                
+                future = executor.submit(
+                    send_update_transaction,
+                    account=account,
+                    private_key=private_key,
+                    record_id=record_id
+                )
+                futures.append(future)
+            
+            for future in as_completed(futures):
+                if future.result():
+                    successful_txs += 1
+            
+            time.sleep(0.1)
+    
+    elapsed_time = time.time() - start_time
+    tps = successful_txs / elapsed_time
+    logger.info(f"Test finished: Concurrent users = {concurrent_users}, Successful TXs = {successful_txs}, "
+                f"Elapsed time = {elapsed_time:.2f}s, TPS = {tps:.2f}")
+    
+    return {
+        "concurrent_users": concurrent_users,
+        "successful_txs": successful_txs,
+        "elapsed_time": elapsed_time,
+        "tps": tps
+    }
 
+# Main Test Flow
 if __name__ == "__main__":
-    # Kill old Ganache (if any)
-    subprocess.run(["pkill", "-f", "ganache-cli"], capture_output=True)
-    # Run tests
-    run_tests()
-    # Cleanup
-    subprocess.run(["pkill", "-f", "ganache-cli"], capture_output=True)
+    test_results = []
+    
+    for users in CONCURRENT_USER_RANGES:
+        result = throughput_test(users)
+        test_results.append(result)
+    
+    print("\n" + "="*50)
+    print("RBDMS Throughput Test Summary Report")
+    print("="*50)
+    for res in test_results:
+        print(f"Concurrent Users: {res['concurrent_users']:3d} | "
+              f"Successful TXs: {res['successful_txs']:4d} | "
+              f"Elapsed Time: {res['elapsed_time']:6.2f}s | "
+              f"TPS: {res['tps']:5.2f}")
+    print("="*50)
+
+    import csv
+    with open("rbdms_throughput_test.csv", "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=["concurrent_users", "successful_txs", "elapsed_time", "tps"])
+        writer.writeheader()
+        writer.writerows(test_results)
+    print("\nTest results saved to rbdms_throughput_test.csv")
+
+# Would you like me to generate a **visualization script** for plotting the throughput test results (matching Fig.6 in the paper)?
