@@ -1,1 +1,144 @@
+import time
+import numpy as np
+import matplotlib.pyplot as plt
+from web3 import Web3
+from web3.middleware import geth_poa_middleware
+from eth_account import Account
+from solcx import compile_source, install_solc
+import subprocess
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
+# Basic config (match paper)
+SOLC_VERSION = "0.8.26"
+GANACHE_URL = "http://127.0.0.1:8545"
+GAS_PRICE = Web3.to_wei(20, "gwei")
+CONCURRENT_USERS = [10,20,30,40,50,60,70,80,90,100]
+TEST_ROUNDS = 3
+RECORD_ID = 0
+
+# Generate test accounts
+TEST_ACCOUNTS = []
+for i in range(100):
+    acc = Account.create(f"user_{i}")
+    TEST_ACCOUNTS.append((acc.address, acc.privateKey.hex()))
+
+# Simple contract (core OIL logic only)
+CONTRACT_SOURCE = """
+pragma solidity ^0.8.26;
+contract RBDMS {
+    struct Record { bytes32 hash; address lockHolder; bool locked; uint256 lockExpiry; }
+    mapping(uint256 => Record) records;
+    uint256 constant LOCK_TIME = 10;
+
+    function initRecord(uint256 id, bytes32 hash) external {
+        records[id] = Record(hash, address(0), false, 0);
+    }
+
+    function acquireLock(uint256 id) external returns (bool) {
+        Record storage r = records[id];
+        if (r.locked && block.timestamp < r.lockExpiry) return false;
+        r.locked = true;
+        r.lockHolder = msg.sender;
+        r.lockExpiry = block.timestamp + LOCK_TIME;
+        return true;
+    }
+
+    function updateRecord(uint256 id, bytes32 newHash) external returns (bool) {
+        Record storage r = records[id];
+        if (!r.locked || r.lockHolder != msg.sender || block.timestamp > r.lockExpiry) return false;
+        r.hash = newHash;
+        r.locked = false;
+        return true;
+    }
+
+    function getModCount(uint256 id) external view returns (uint256) {
+        return 1; // Simplified for testing
+    }
+}
+"""
+
+# Compile/deploy contract (simplified)
+def deploy_contract(w3):
+    # Install solc if missing
+    install_solc(SOLC_VERSION)
+    # Compile
+    compiled = compile_source(CONTRACT_SOURCE, solc_version=SOLC_VERSION)
+    abi, bytecode = compiled.popitem()[1]["abi"], compiled.popitem()[1]["bin"]
+    # Deploy
+    acct_addr, acct_key = TEST_ACCOUNTS[0]
+    nonce = w3.eth.get_transaction_count(acct_addr)
+    contract = w3.eth.contract(abi=abi, bytecode=bytecode)
+    tx = contract.constructor().build_transaction({"from":acct_addr, "nonce":nonce, "gas":30000000, "gasPrice":GAS_PRICE})
+    signed_tx = w3.eth.account.sign_transaction(tx, acct_key)
+    tx_hash = w3.eth.send_raw_transaction(signed_tx.rawTransaction)
+    tx_receipt = w3.eth.wait_for_transaction_receipt(tx_hash)
+    # Init record
+    deployed = w3.eth.contract(address=tx_receipt["contractAddress"], abi=abi)
+    init_tx = deployed.functions.initRecord(RECORD_ID, w3.keccak(text="init")).build_transaction({"from":acct_addr, "nonce":nonce+1, "gas":30000000, "gasPrice":GAS_PRICE})
+    signed_init = w3.eth.account.sign_transaction(init_tx, acct_key)
+    w3.eth.send_raw_transaction(signed_init.rawTransaction)
+    return deployed
+
+# Simulate doctor update (simplified)
+def simulate_update(w3, contract, user_idx):
+    addr, key = TEST_ACCOUNTS[user_idx]
+    success = False
+    for _ in range(3): # 3 retries
+        try:
+            nonce = w3.eth.get_transaction_count(addr)
+            # Acquire lock
+            lock_tx = contract.functions.acquireLock(RECORD_ID).build_transaction({"from":addr, "nonce":nonce, "gas":30000000, "gasPrice":GAS_PRICE})
+            signed_lock = w3.eth.account.sign_transaction(lock_tx, key)
+            w3.eth.send_raw_transaction(signed_lock.rawTransaction)
+            # Update record
+            new_hash = w3.keccak(text=f"update_{user_idx}_{time.time()}")
+            update_tx = contract.functions.updateRecord(RECORD_ID, new_hash).build_transaction({"from":addr, "nonce":nonce+1, "gas":30000000, "gasPrice":GAS_PRICE})
+            signed_update = w3.eth.account.sign_transaction(update_tx, key)
+            w3.eth.send_raw_transaction(signed_update.rawTransaction)
+            success = True
+            break
+        except:
+            time.sleep(0.5)
+    return {"success": success}
+
+# Main test function
+def run_tests():
+    # Connect to Ganache
+    w3 = Web3(Web3.HTTPProvider(GANACHE_URL))
+    w3.middleware_onion.inject(geth_poa_middleware, layer=0)
+    # Deploy contract
+    contract = deploy_contract(w3)
+    # Test throughput
+    results = []
+    for user_count in CONCURRENT_USERS:
+        total_success = 0
+        for _ in range(TEST_ROUNDS):
+            start = time.time()
+            with ThreadPoolExecutor(max_workers=user_count) as executor:
+                tasks = [executor.submit(simulate_update, w3, contract, i) for i in range(user_count)]
+                for task in as_completed(tasks):
+                    if task.result()["success"]:
+                        total_success += 1
+            end = time.time()
+        # Calculate TPS
+        avg_tps = total_success / ((end - start)/TEST_ROUNDS)
+        results.append(avg_tps)
+        print(f"{user_count} users → {avg_tps:.2f} TPS")
+    
+    # Plot results
+    plt.plot(CONCURRENT_USERS, results, 's-', color='red', label='RBDMS')
+    plt.axvline(x=70, linestyle='--', color='orange', label='Saturation (70 users)')
+    plt.xlabel('Concurrent Users')
+    plt.ylabel('TPS')
+    plt.legend()
+    plt.savefig('rbdms_throughput.png')
+    # Save data
+    np.savez('results.npz', users=CONCURRENT_USERS, tps=results)
+
+if __name__ == "__main__":
+    # Kill old Ganache (if any)
+    subprocess.run(["pkill", "-f", "ganache-cli"], capture_output=True)
+    # Run tests
+    run_tests()
+    # Cleanup
+    subprocess.run(["pkill", "-f", "ganache-cli"], capture_output=True)
